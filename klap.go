@@ -1,4 +1,4 @@
-package main
+package goklap
 
 import (
 	"bytes"
@@ -6,19 +6,74 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"slices"
 )
 
-func getNonce() []byte {
+type Klap struct {
+	host     string
+	port     string
+	client   http.Client
+	authHash []byte
+}
+
+func New(host, port, user, pass string) Klap {
+	authHash := hashAuth(user, pass)
+	jar, _ := cookiejar.New(nil)
+	return Klap{host: host, port: port, authHash: authHash[:], client: http.Client{Jar: jar}}
+}
+
+/*
+Sends a request to the klap device.
+Parameters:
+  - target is the endpoint to send the request to, the url will be http://host:port/app/target?seq=seq.
+    Seq is the sequence number of the request, handled by the library
+  - msg is the message to send
+  - params are the query parameters to send, seq will be added by the library
+
+Returns:
+  - The response from the device as a byte array
+  - An error if something went wrong (connection, encryption, etc)
+*/
+func (k *Klap) Request(target, msg string, params url.Values) ([]byte, error) {
+	localSeed, remoteSeed, err := k.handshake()
+	if err != nil {
+		return nil, err
+	}
+	chiper, err := newKlapChiper(localSeed, remoteSeed, k.authHash)
+	if err != nil {
+		return nil, err
+	}
+	encryptedPayload, err := chiper.encrypt([]byte(msg))
+	if err != nil {
+		return nil, err
+	}
+	if params == nil {
+		params = url.Values{}
+	}
+	params.Add("seq", fmt.Sprintf("%d", chiper.seq))
+	requestUrl := k.baseUrl() + "/" + target + "?" + params.Encode()
+	encryptedResponse, err := k.doRequest(encryptedPayload, requestUrl)
+	if err != nil {
+		return nil, err
+	}
+	decryptedResponse, err := chiper.decrypt(encryptedResponse[32:])
+	if err != nil {
+		return nil, err
+	}
+	return decryptedResponse, nil
+}
+
+func getNonce() ([]byte, error) {
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
-		log.Fatalln(err)
+		return nil, err
 	}
-	return nonce
+	return nonce, nil
 }
 
 func hashAuth(user, pass string) [32]byte {
@@ -37,35 +92,22 @@ func hashHandshake2(local_seed, remote_seed, auth_hash []byte) [32]byte {
 	return sha256.Sum256(append(append(remote_seed, local_seed...), auth_hash...))
 }
 
-type Klap struct {
-	Host     string
-	Port     string
-	client   http.Client
-	authHash []byte
-}
-
-func New(host, port, user, pass string) Klap {
-	authHash := hashAuth(user, pass)
-	jar, _ := cookiejar.New(nil)
-	return Klap{Host: host, Port: port, authHash: authHash[:], client: http.Client{Jar: jar}}
-}
-
 func (k Klap) baseUrl() string {
-	return "http://" + k.Host + ":" + k.Port + "/app"
+	return "http://" + k.host + ":" + k.port + "/app"
 }
 
 func (k *Klap) doHandshakeReq1(data []byte) ([]byte, error) {
 	url := k.baseUrl() + "/handshake1"
-	return k.doHandshakeReq(data, url)
+	return k.doRequest(data, url)
 }
 
 func (k *Klap) doHandshakeReq2(data []byte) ([]byte, error) {
 	url := k.baseUrl() + "/handshake2"
-	return k.doHandshakeReq(data, url)
+	return k.doRequest(data, url)
 }
 
-func (k *Klap) doHandshakeReq(data []byte, url string) ([]byte, error) {
-	resp, err := k.client.Post(url, "application/octet-stream", bytes.NewBuffer(data))
+func (k *Klap) doRequest(payload []byte, url string) ([]byte, error) {
+	resp, err := k.client.Post(url, "application/octet-stream", bytes.NewBuffer(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -81,8 +123,10 @@ func (k *Klap) doHandshakeReq(data []byte, url string) ([]byte, error) {
 }
 
 func (k *Klap) handshake1() ([]byte, []byte, error) {
-	localSeed := getNonce()
-
+	localSeed, err := getNonce()
+	if err != nil {
+		return nil, nil, err
+	}
 	body, err := k.doHandshakeReq1(localSeed)
 	if err != nil {
 		return nil, nil, err
@@ -103,10 +147,16 @@ func (k *Klap) handshake2(localSeed, remoteSeed []byte) error {
 	return err
 }
 
-func (k *Klap) Handshake() error {
+func (k *Klap) handshake() ([]byte, []byte, error) {
+	newCookieJar, _ := cookiejar.New(nil)
+	k.client.Jar = newCookieJar
 	localSeed, remoteSeed, err := k.handshake1()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	return k.handshake2(localSeed, remoteSeed)
+	err = k.handshake2(localSeed, remoteSeed)
+	if err != nil {
+		return nil, nil, err
+	}
+	return localSeed, remoteSeed, nil
 }
